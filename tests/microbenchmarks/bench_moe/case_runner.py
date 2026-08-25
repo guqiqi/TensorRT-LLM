@@ -289,7 +289,26 @@ def _initial_instrumentation(
         "build_ms": None,
         "weight_experts_built": None,
         "num_experts": None,
+        # Per-phase wall time for one candidate. The timed forward is only one
+        # entry here; the point is to show what the other phases cost so setup
+        # work is optimized by measurement rather than by guesswork.
+        "phase_ms": {},
     }
+
+
+def _lap(instrumentation: Dict[str, Any], name: str, t_prev: float) -> float:
+    """Charge the time since ``t_prev`` to phase ``name`` and restart the clock.
+
+    Incremental rather than a context manager because ``_run_one_candidate``
+    short-circuits from several places: whatever phases completed before the
+    early return stay recorded. Each boundary syncs, so async GPU work lands in
+    the phase that issued it instead of the next phase's first wait.
+    """
+    torch.cuda.synchronize()
+    now = time.perf_counter()
+    phases = instrumentation.setdefault("phase_ms", {})
+    phases[name] = phases.get(name, 0.0) + (now - t_prev) * 1e3
+    return now
 
 
 def _pick_enable_perfect_router(
@@ -657,6 +676,7 @@ def _run_one_candidate(
     result = RunResult(model=model, workload=workload, config=config)
     rc_spec = workload.routing_control
     rc_active = rc_spec.is_active
+    _phase_t = time.perf_counter()
 
     # ---- Step 1: layout + routing plan ----------------------------------
     layout = _resolve_layout_and_plan(
@@ -677,6 +697,8 @@ def _run_one_candidate(
     all_rank_num_tokens = list(per_rank)
 
     result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx, nsys)
+    # Step 1 ran before the dict existed, so charge it retroactively.
+    _phase_t = _lap(result.instrumentation, "routing_plan", _phase_t)
 
     # ---- Step 2: mapping + AutoTuner + comm env -------------------------
     try:
@@ -702,6 +724,7 @@ def _run_one_candidate(
     enable_perfect_router = _pick_enable_perfect_router(
         rc_spec, bool(enable_perfect_router_requested)
     )
+    _phase_t = _lap(result.instrumentation, "mapping_autotune_setup", _phase_t)
 
     moe = None
     try:
@@ -742,6 +765,7 @@ def _run_one_candidate(
             moe, "_bench_weight_experts_built", None
         )
         result.instrumentation["num_experts"] = int(model.num_experts)
+        _phase_t = _lap(result.instrumentation, "build", _phase_t)
 
         result.actual_backend = _backend_name_from_module(moe)
         result.scheduler_kind = _scheduler_kind_name(moe)
@@ -813,6 +837,8 @@ def _run_one_candidate(
         materialized_ids = routing_inputs.materialized_ids if routing_inputs else None
         materialized_scales = routing_inputs.materialized_scales if routing_inputs else None
 
+        _phase_t = _lap(result.instrumentation, "inputs_routing", _phase_t)
+
         # ---- Step 5: autotune + timed forward ---------------------------
         with _maybe_install_routing_control_patch(
             moe,
@@ -828,6 +854,7 @@ def _run_one_candidate(
                 autotune_status = f"failed:{type(exc).__name__}: {exc}"
                 _maybe_print_rank0(f"[bench_moe] autotune skipped: {type(exc).__name__}: {exc}")
             result.instrumentation["autotune_status"] = autotune_status
+            _phase_t = _lap(result.instrumentation, "autotune", _phase_t)
 
             try:
                 if config.cuda_graph:
@@ -856,6 +883,10 @@ def _run_one_candidate(
                 reason = f"timed phase error: {type(exc).__name__}: {exc}"
                 _maybe_print_rank0(f"[bench_moe] {reason}\n{traceback.format_exc()}")
                 return _short_circuit(result, "failed", reason)
+
+        # ``timed_forward`` covers warmup + graph capture + the measured
+        # replays, i.e. everything the latency number is derived from.
+        _phase_t = _lap(result.instrumentation, "timed_forward", _phase_t)
 
         # ---- Step 6: aggregate latency, kernels, routing observation ----
         # The comm factory may swap moe.comm to AllGatherReduceScatter inside
@@ -894,6 +925,7 @@ def _run_one_candidate(
             )
 
         result.status_per_rank = _gather_status_per_rank("success")
+        _phase_t = _lap(result.instrumentation, "aggregate_observe", _phase_t)
         return result
     finally:
         # Always free GPU memory and restore the per-case env var so the next
@@ -907,3 +939,7 @@ def _run_one_candidate(
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
         else:
             os.environ["TRTLLM_FORCE_COMM_METHOD"] = prev_force_comm
+        # Reached on the success path and on every short-circuit, so on an early
+        # return this also absorbs whatever ran since the last completed phase.
+        if isinstance(result.instrumentation, dict):
+            _lap(result.instrumentation, "teardown", _phase_t)
