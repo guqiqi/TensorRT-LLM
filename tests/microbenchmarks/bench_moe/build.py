@@ -395,6 +395,10 @@ def _build_moe_module(
         else {}
     )
 
+    # Evidence of which path actually ran, so a null perf result can be told
+    # apart from the subset never having been applied.
+    moe._bench_weight_experts_built = len(subset_kwargs["expert_ids"]) if subset_kwargs else None
+
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         # ``create_ref_weights=False``: the reference-module weights exist for
         # the accuracy tests that share this helper. This benchmark only times

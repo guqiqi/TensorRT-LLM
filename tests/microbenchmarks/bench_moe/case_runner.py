@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -280,6 +281,14 @@ def _initial_instrumentation(
         "kernel_breakdown_available": "kernels" in analysis,
         "autotune_status": "not_run",
         "latency_source": "cuda_event_external" if config.cuda_graph else "cuda_event_eager",
+        # Untimed-setup accounting. ``build_ms`` covers module construction plus
+        # expert-weight synthesis/quantization/load -- the part that scales with
+        # expert count, and the only part an expert-subset optimization can move.
+        # ``weight_experts_built`` is None when the full checkout-shaped set was
+        # synthesized, so a flat build_ms can be attributed rather than guessed at.
+        "build_ms": None,
+        "weight_experts_built": None,
+        "num_experts": None,
     }
 
 
@@ -697,6 +706,10 @@ def _run_one_candidate(
     moe = None
     try:
         # ---- Step 3: build MoE module and validate ----------------------
+        # Weight synthesis is async on the CUDA stream, so bracket the build
+        # with a sync to attribute it rather than the next phase's first wait.
+        torch.cuda.synchronize()
+        _build_t0 = time.perf_counter()
         try:
             moe, _ = _build_moe_module(
                 model=model,
@@ -723,6 +736,12 @@ def _run_one_candidate(
             reason = f"build error: {type(exc).__name__}: {exc}"
             _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)
+        torch.cuda.synchronize()
+        result.instrumentation["build_ms"] = (time.perf_counter() - _build_t0) * 1e3
+        result.instrumentation["weight_experts_built"] = getattr(
+            moe, "_bench_weight_experts_built", None
+        )
+        result.instrumentation["num_experts"] = int(model.num_experts)
 
         result.actual_backend = _backend_name_from_module(moe)
         result.scheduler_kind = _scheduler_kind_name(moe)
