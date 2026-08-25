@@ -378,16 +378,33 @@ def _build_moe_module(
     moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo, mapping))
     moe = _create_moe_for_benchmark(**moe_kwargs)
 
+    # Synthesize only this rank's shard of the expert weights. ``create_weights``
+    # is checkpoint-shaped -- it loops over ALL experts -- but ``load_weights``
+    # keeps only ``initial_local_expert_ids``, so under EP the benchmark was
+    # building (1 - 1/ep_size) of every expert set just to drop it. Read the id
+    # list off the module rather than recomputing the partition: it is the exact
+    # list the loader indexes with, including the uneven-split and DWDP cases.
+    # ``supports_expert_subset`` is opt-in per quantize util because some loaders
+    # sweep range(num_experts) with bare indexing (KeyError) or reduce over a
+    # preallocated buffer (silent garbage); those keep the full-set path.
+    # Passed as a kwarg only when supported: an unsupporting util would swallow
+    # ``expert_ids`` into its ``**quant_kwargs`` and forward it downstream.
+    subset_kwargs = (
+        {"expert_ids": list(moe.initial_local_expert_ids)}
+        if getattr(quantize_util, "supports_expert_subset", False)
+        else {}
+    )
+
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         # ``create_ref_weights=False``: the reference-module weights exist for
         # the accuracy tests that share this helper. This benchmark only times
         # the backend, so synthesizing a second full expert set per case is
         # pure overhead.
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(
-            moe, create_ref_weights=False, **quant_kwargs
+            moe, create_ref_weights=False, **subset_kwargs, **quant_kwargs
         )
     else:
-        weights = quantize_util.create_weights(**quant_kwargs)
+        weights = quantize_util.create_weights(**subset_kwargs, **quant_kwargs)
 
     moe.load_weights([weights])
     moe.post_load_weights()

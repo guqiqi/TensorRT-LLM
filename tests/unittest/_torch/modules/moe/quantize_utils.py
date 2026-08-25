@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -437,6 +437,15 @@ class BaseQuantizeUtil(ABC):
     Supports swiglu_gptoss_style with custom swiglu parameters.
     """
 
+    #: Whether ``create_weights(expert_ids=...)`` is honored by this util AND
+    #: the matching ``FusedMoEMethod`` only reads the emitted subset back.
+    #: Opt-in per class: a util whose loader sweeps ``range(num_experts)`` with
+    #: bare ``weights[...]`` indexing would raise KeyError, and one that reduces
+    #: over a preallocated buffer would silently mix in uninitialized values.
+    #: Subclasses that inherit a supporting implementation but pair it with a
+    #: stricter loader MUST set this back to False.
+    supports_expert_subset: bool = False
+
     def __init__(
         self,
         num_experts: int,
@@ -481,6 +490,27 @@ class BaseQuantizeUtil(ABC):
     def swiglu_gptoss_style(self) -> bool:
         """Check if swiglu_gptoss_style is enabled."""
         return self._swiglu_gptoss_style
+
+    def _weight_expert_ids(self, expert_ids: Optional[Sequence[int]]) -> Sequence[int]:
+        """Resolve which experts ``create_weights`` should synthesize.
+
+        ``None`` (the default everywhere in the accuracy tests) means the full
+        checkpoint-shaped set. Benchmarks that only ever load one EP rank's
+        shard pass that rank's ``initial_local_expert_ids`` instead, which is
+        the same list the loader indexes with, so nothing that is read back
+        goes missing.
+        """
+        if expert_ids is None:
+            return range(self.num_experts)
+        ids = list(expert_ids)
+        if not ids:
+            raise ValueError("expert_ids must not be empty")
+        out_of_range = [e for e in ids if not 0 <= e < self.num_experts]
+        if out_of_range:
+            raise ValueError(
+                f"expert_ids out of range for num_experts={self.num_experts}: {out_of_range}"
+            )
+        return ids
 
     def _create_swiglu_tensors(self) -> Dict[str, torch.Tensor]:
         """
@@ -770,7 +800,11 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
     Supports element-wise activations (Relu2, Silu) via activation_type.
     """
 
-    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+    supports_expert_subset = True
+
+    def create_weights(
+        self, *, expert_ids: Optional[Sequence[int]] = None, **quant_kwargs
+    ) -> Dict[str, torch.Tensor]:
         """
         Create quantized weights for MoE experts.
         """
@@ -778,7 +812,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             "expect quant_algo to be NVFP4"
         )
         weights = {}
-        for expert_id in range(self.num_experts):
+        for expert_id in self._weight_expert_ids(expert_ids):
             w1_weight = (
                 torch.randn(
                     (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
@@ -835,10 +869,6 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 w3_weight_nvfp4 = torch.empty(0, dtype=torch.uint8, device="cuda")
                 w3_sf_block_unswizzled = torch.empty(0, dtype=torch.float8_e4m3fn, device="cuda")
 
-            w1_input_scale = x_sf_global.cuda()
-            w2_input_scale = x_sf_global.cuda()
-            w3_input_scale = x_sf_global.cuda()
-
             weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4
             weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4
             weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4
@@ -851,9 +881,6 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
             ).cuda()
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
-            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
             weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
@@ -874,6 +901,19 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                     weights[f"{expert_id}.w3.bias"] = torch.empty(
                         0, device="cuda", dtype=torch.float
                     )
+
+        # ``input_scale`` is emitted for EVERY expert even when only a subset of
+        # the weights was synthesized: it is a weight-independent broadcast of
+        # ``1/x_sf_global`` (identical for all experts), while the loader reads
+        # it with a ``range(module.num_experts)`` sweep whose reduction feeds
+        # ``fc31_input_scale`` / ``fc2_input_scale``, and the MegaMoE-CuteDSL
+        # method hard-fails unless every expert is covered. Keeping it full-set
+        # costs three scalars per expert and preserves both exactly.
+        input_scale = 1.0 / quant_kwargs["x_sf_global"].cuda()
+        for expert_id in range(self.num_experts):
+            weights[f"{expert_id}.w1.input_scale"] = input_scale
+            weights[f"{expert_id}.w2.input_scale"] = input_scale
+            weights[f"{expert_id}.w3.input_scale"] = input_scale
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=NVFP4RefMLPFusedMoE) -> torch.nn.Module:
@@ -1156,12 +1196,16 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
     for FP8 block-wise quantized MoE modules.
     """
 
+    supports_expert_subset = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Will be set by create_weights() if ref_cls is provided in quant_kwargs
         self._ref_cls = None
 
-    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+    def create_weights(
+        self, *, expert_ids: Optional[Sequence[int]] = None, **quant_kwargs
+    ) -> Dict[str, torch.Tensor]:
         """
         Create quantized weights for MoE experts using FP8 block-wise quantization.
 
@@ -1186,7 +1230,7 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
         quant_fn = per_block_cast_to_fp8_e8m0 if use_e8m0_scale else per_block_cast_to_fp8
 
         weights = {}
-        for expert_id in range(self.num_experts):
+        for expert_id in self._weight_expert_ids(expert_ids):
             w1_weight, w2_weight, w3_weight = _create_fp8_block_scale_base_weights(
                 self.intermediate_size, self.hidden_size, self.dtype, "cuda"
             )
@@ -1518,7 +1562,11 @@ class DeepGemmFP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
     Uses E8M0 scale format and DeepGemmFP8BlockScalesRefFusedMoE as reference.
     """
 
-    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+    supports_expert_subset = True
+
+    def create_weights(
+        self, *, expert_ids: Optional[Sequence[int]] = None, **quant_kwargs
+    ) -> Dict[str, torch.Tensor]:
         """Create quantized weights using E8M0 scale format for DEEPGEMM."""
         assert (
             self.quant_config is not None
@@ -1526,7 +1574,7 @@ class DeepGemmFP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
         ), "expect quant_algo to be FP8_BLOCK_SCALES"
 
         weights = {}
-        for expert_id in range(self.num_experts):
+        for expert_id in self._weight_expert_ids(expert_ids):
             w1_weight, w2_weight, w3_weight = _create_fp8_block_scale_base_weights(
                 self.intermediate_size, self.hidden_size, self.dtype, "cuda"
             )
@@ -1803,7 +1851,16 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
     for W4A8_MXFP4_MXFP8 quantized MoE modules.
     """
 
-    def prepare_weights_from_backend(self, backend, *, create_ref_weights=True, **quant_kwargs):
+    supports_expert_subset = True
+
+    def prepare_weights_from_backend(
+        self,
+        backend,
+        *,
+        create_ref_weights=True,
+        expert_ids: Optional[Sequence[int]] = None,
+        **quant_kwargs,
+    ):
         """
         Prepare weights for backend and reference module based on actual backend shapes.
 
@@ -1816,6 +1873,9 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
                 weights and return ``None`` in their place. Accuracy tests need
                 them; throughput benchmarks do not, and synthesizing a second
                 full expert set is the single most expensive step here.
+            expert_ids: Restrict the BACKEND weights to these experts (see
+                ``BaseQuantizeUtil._weight_expert_ids``). The reference weights
+                are always full-set: the reference module runs every expert.
             **quant_kwargs: Additional quantization parameters
 
         Returns:
@@ -1846,7 +1906,7 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
             pad_zero_or_val=tp_size > 1,
             bias=self.bias,  # Pass bias from self to create bias weights
         )
-        backend_weights = self.create_weights(**backend_kwargs)
+        backend_weights = self.create_weights(expert_ids=expert_ids, **backend_kwargs)
 
         # Ref weights: zero padding, use weight_alignment for input_hidden
         if create_ref_weights:
@@ -1873,7 +1933,9 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
 
         return backend_weights, ref_weights, ref_module_kwargs
 
-    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+    def create_weights(
+        self, *, expert_ids: Optional[Sequence[int]] = None, **quant_kwargs
+    ) -> Dict[str, torch.Tensor]:
         """
         Create quantized weights for MoE experts using MXFP4 quantization.
 
@@ -1905,7 +1967,7 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         contam_val = 42
 
         weights = {}
-        for expert_id in range(self.num_experts):
+        for expert_id in self._weight_expert_ids(expert_ids):
             if self.bias:
                 w1_bias = torch.randn((intermediate_size_unpadded,), dtype=self.dtype).cuda() * 0.1
                 w2_bias = torch.randn((hidden_size_unpadded,), dtype=self.dtype).cuda() * 0.1
@@ -2337,6 +2399,11 @@ class MXFP4FP8QuantizeUtil(MXFP4MXFP8QuantizeUtil):
     (asserted inside load_quant_scales); we satisfy this by using a shared
     activation scale derived from x_sf_global.
     """
+
+    # Overrides the parent's opt-in: both W4A8_MXFP4_FP8 loaders read
+    # ``weights[f"{expert_id}.w1.input_scale"]`` for the FULL range(num_experts)
+    # with bare indexing, so a subset would raise KeyError rather than degrade.
+    supports_expert_subset = False
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
         assert (
