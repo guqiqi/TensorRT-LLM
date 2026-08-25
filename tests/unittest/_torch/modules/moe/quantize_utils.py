@@ -1803,7 +1803,7 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
     for W4A8_MXFP4_MXFP8 quantized MoE modules.
     """
 
-    def prepare_weights_from_backend(self, backend, **quant_kwargs):
+    def prepare_weights_from_backend(self, backend, *, create_ref_weights=True, **quant_kwargs):
         """
         Prepare weights for backend and reference module based on actual backend shapes.
 
@@ -1812,6 +1812,10 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
 
         Args:
             backend: The MoE backend instance (to get actual shapes and alignments)
+            create_ref_weights: When False, skip generating the reference-module
+                weights and return ``None`` in their place. Accuracy tests need
+                them; throughput benchmarks do not, and synthesizing a second
+                full expert set is the single most expensive step here.
             **quant_kwargs: Additional quantization parameters
 
         Returns:
@@ -1845,16 +1849,19 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         backend_weights = self.create_weights(**backend_kwargs)
 
         # Ref weights: zero padding, use weight_alignment for input_hidden
-        ref_kwargs = dict(
-            quant_kwargs,
-            hidden_size_in=hidden_size_in,
-            hidden_size_out=hidden_size_in,  # same as hidden_size_in
-            intermediate_size=inter_size,
-            input_hidden_alignment=weight_align,
-            pad_zero_or_val=True,
-            bias=self.bias,  # Pass bias from self to create bias weights
-        )
-        ref_weights = self.create_weights(**ref_kwargs)
+        if create_ref_weights:
+            ref_kwargs = dict(
+                quant_kwargs,
+                hidden_size_in=hidden_size_in,
+                hidden_size_out=hidden_size_in,  # same as hidden_size_in
+                intermediate_size=inter_size,
+                input_hidden_alignment=weight_align,
+                pad_zero_or_val=True,
+                bias=self.bias,  # Pass bias from self to create bias weights
+            )
+            ref_weights = self.create_weights(**ref_kwargs)
+        else:
+            ref_weights = None
 
         # Kwargs for creating ref module
         # hidden_size_unpadded is the original hidden_size for input padding and output truncation

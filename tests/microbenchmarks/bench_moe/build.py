@@ -379,8 +379,12 @@ def _build_moe_module(
     moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        # ``create_ref_weights=False``: the reference-module weights exist for
+        # the accuracy tests that share this helper. This benchmark only times
+        # the backend, so synthesizing a second full expert set per case is
+        # pure overhead.
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(
-            moe, **quant_kwargs
+            moe, create_ref_weights=False, **quant_kwargs
         )
     else:
         weights = quantize_util.create_weights(**quant_kwargs)
